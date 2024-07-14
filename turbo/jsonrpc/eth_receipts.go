@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/ledgerwatch/log/v3"
@@ -605,7 +606,10 @@ func getAddrsBitmapV3(tx kv.TemporalTx, addrs []common.Address, from, to uint64)
 
 // GetTransactionReceipt implements eth_getTransactionReceipt. Returns the receipt of a transaction given the transaction's hash.
 func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Hash) (map[string]interface{}, error) {
+	start := time.Now()
 	tx, err := api.db.BeginRo(ctx)
+	timeBeginRo := time.Since(start)
+	start = time.Now()
 	if err != nil {
 		return nil, err
 	}
@@ -619,6 +623,8 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 		return nil, err
 	}
 
+	timeTxnLookup := time.Since(start)
+	start = time.Now()
 	cc, err := api.chainConfig(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -636,6 +642,8 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 	}
 
 	block, err := api.blockByNumberWithSenders(ctx, tx, blockNum)
+	timeBlockByNumber := time.Since(start)
+	start = time.Now()
 	if err != nil {
 		return nil, err
 	}
@@ -660,10 +668,13 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 			borTx = bortypes.NewBorTransaction()
 		}
 	}
+	timeGotTxn := time.Since(start)
+	start = time.Now()
 	receipts, err := api.getReceipts(ctx, tx, block, block.Body().SendersFromTxs())
 	if err != nil {
 		return nil, fmt.Errorf("getReceipts error: %w", err)
 	}
+	timeGetReceipts := time.Since(start)
 
 	if txn == nil && cc.Bor != nil {
 		borReceipt, err := rawdb.ReadBorReceipt(tx, block.Hash(), blockNum, receipts)
@@ -679,6 +690,8 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 	if len(receipts) <= int(txnIndex) {
 		return nil, fmt.Errorf("block has less receipts than expected: %d <= %d, block: %d", len(receipts), int(txnIndex), blockNum)
 	}
+
+	log.Info("getTxReceipt", "hash", txnHash.Hex(), "beginRo", timeBeginRo, "txnLookup", timeTxnLookup, "blockByNumber", timeBlockByNumber, "gotTxns", timeGotTxn, "getReceipts", timeGetReceipts)
 
 	return ethutils.MarshalReceipt(receipts[txnIndex], block.Transactions()[txnIndex], cc, block.HeaderNoCopy(), txnHash, true), nil
 }

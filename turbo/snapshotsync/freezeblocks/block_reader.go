@@ -656,9 +656,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 		return
 	}
 
-	view := r.sn.View()
-	defer view.Close()
-	seg, ok := view.HeadersSegment(blockHeight)
+	seg, ok, rUnlockHeaders := getSegmentAndRLock(r.sn, coresnaptype.Headers, blockHeight)
 	if !ok {
 		if dbgLogs {
 			log.Info(dbgPrefix + "no header files for this block num")
@@ -668,6 +666,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 
 	var buf []byte
 	h, buf, err := r.headerFromSnapshot(blockHeight, seg, buf)
+	rUnlockHeaders()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -681,7 +680,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 	var b *types.Body
 	var baseTxnId uint64
 	var txsAmount uint32
-	bodySeg, ok := view.BodiesSegment(blockHeight)
+	bodySeg, ok, rUnlockBody := getSegmentAndRLock(r.sn, coresnaptype.Bodies, blockHeight)
 	if !ok {
 		if dbgLogs {
 			log.Info(dbgPrefix + "no bodies file for this block num")
@@ -689,6 +688,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 		return
 	}
 	b, baseTxnId, txsAmount, buf, err = r.bodyFromSnapshot(blockHeight, bodySeg, buf)
+	rUnlockBody()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -710,7 +710,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 		return block, senders, nil
 	}
 
-	txnSeg, ok := view.TxsSegment(blockHeight)
+	txnSeg, ok, rUnlockTxs := getSegmentAndRLock(r.sn, coresnaptype.Transactions, blockHeight)
 	if !ok {
 		if dbgLogs {
 			log.Info(dbgPrefix+"no transactions file for this block num", "r.sn.BlocksAvailable()", r.sn.BlocksAvailable(), "r.sn.indicesReady", r.sn.indicesReady.Load())
@@ -719,6 +719,7 @@ func (r *BlockReader) blockWithSenders(ctx context.Context, tx kv.Getter, hash c
 	}
 	var txs []types.Transaction
 	txs, senders, err = r.txsFromSnapshot(baseTxnId, txsAmount, txnSeg, buf)
+	rUnlockTxs()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -916,9 +917,16 @@ func (r *BlockReader) txnByID(txnID uint64, sn *Segment, buf []byte) (txn types.
 }
 
 func (r *BlockReader) txnByHash(txnHash common.Hash, segments []*Segment, buf []byte) (types.Transaction, uint64, bool, error) {
-	for i := len(segments) - 1; i >= 0; i-- {
-		sn := segments[i]
+	// start := time.Now()
+	var i int
+	/*
+		defer func() {
+			log.Info("txnByHash", "segments", len(segments)-i, "hash", txnHash.Hex(), "start", start.String(), "end", time.Now().String(), "since", time.Since(start))
+		}()
+	*/
 
+	for i = len(segments) - 1; i >= 0; i-- {
+		sn := segments[i]
 		idxTxnHash := sn.Index(coresnaptype.Indexes.TxnHash)
 		idxTxnHash2BlockNum := sn.Index(coresnaptype.Indexes.TxnHash2BlockNum)
 
@@ -1005,6 +1013,32 @@ func (r *BlockReader) TxnByIdxInBlock(ctx context.Context, tx kv.Getter, blockNu
 	return r.txnByID(b.BaseTxId+1+uint64(txIdxInBlock), txnSeg, nil)
 }
 
+func getSegmentsAndRLock(snap *RoSnapshots, segType snaptype.Type) ([]*Segment, func()) {
+	s, _ := snap.segments.Get(segType.Enum())
+	s.lock.RLock()
+	return s.segments, s.lock.RUnlock
+}
+
+// only locks when ok
+func getSegmentAndRLock(snap *RoSnapshots, segType snaptype.Type, blockNum uint64) (*Segment, bool, func()) {
+	if s, ok := snap.segments.Get(segType.Enum()); ok {
+		s.lock.RLock()
+		var locked = true
+		for _, seg := range s.segments {
+			if !(blockNum >= seg.from && blockNum < seg.to) {
+				continue
+			}
+			return seg, true, func() {
+				if locked {
+					s.lock.RUnlock()
+					locked = false
+				}
+			}
+		}
+	}
+	return nil, false, func() {}
+}
+
 // TxnLookup - find blockNumber and txnID by txnHash
 func (r *BlockReader) TxnLookup(_ context.Context, tx kv.Getter, txnHash common.Hash) (uint64, bool, error) {
 	n, err := rawdb.ReadTxLookupEntry(tx, txnHash)
@@ -1015,10 +1049,11 @@ func (r *BlockReader) TxnLookup(_ context.Context, tx kv.Getter, txnHash common.
 		return *n, true, nil
 	}
 
-	view := r.sn.View()
-	defer view.Close()
+	txns, rUnlock := getSegmentsAndRLock(r.sn, coresnaptype.Transactions)
+	defer rUnlock()
 
-	_, blockNum, ok, err := r.txnByHash(txnHash, view.Txs(), nil)
+	_, blockNum, ok, err := r.txnByHash(txnHash, txns, nil)
+
 	if err != nil {
 		return 0, false, err
 	}
